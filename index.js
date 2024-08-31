@@ -1,79 +1,85 @@
-const { Client, LocalAuth } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const pino = require("pino");
+const { Boom } = require("@hapi/boom");
+const fs = require("fs");
 require("dotenv").config();
 
-//Creating instances
+const sessionName = "yusril";
+
+// Inisialisasi instance Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    args: ["--no-sandbox", "--disable-gpu"],
-  },
-  webVersionCache: {
-    type: "remote",
-    remotePath:
-      "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
-  },
-});
 
-//Initializing GenAI model
-const model = genAI.getGenerativeModel({ model: "gemini-pro" });
-
-//Function to generate response from AI model and reply to user
-async function generate(prompt, message) {
+// Fungsi untuk menghasilkan respon dari model AI
+async function generateResponse(prompt) {
+  const model = genAI.getGenerativeModel({ model: "gemini-pro" });
   const result = await model.generateContent(prompt);
-  const response = await result.response;
-  const text = response.text();
-
-  await message.reply(text); //Reply to user
+  return result.response.text();
 }
 
-//All event listeners to know client status
-client.on("qr", (qr) => {
-  qrcode.generate(qr, { small: true });
-});
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState(`./${sessionName ? sessionName : "session"}`);
+  const { version, isLatest } = await fetchLatestBaileysVersion();
 
-client.on("authenticated", () => {
-  console.log("Client is authenticated!");
-});
+  console.log(`Menggunakan versi WA: ${version.join(".")}, versi terbaru: ${isLatest}`);
 
-client.on("ready", () => {
-  console.log("Client is ready!");
-});
+  const sock = makeWASocket({
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: true,
+    auth: state,
+  });
 
-client.on("disconnected", () => {
-  console.log("Client is disconnected!");
-});
+  sock.ev.on("messages.upsert", async (chatUpdate) => {
+    try {
+      const message = chatUpdate.messages[0];
+      if (!message.message) return;
 
-client.on("auth_failure", () => {
-  console.log("Client is auth_failure!");
-});
-
-client.on("message", async (message) => {
-  // ignore if group message
-  const isGroup = message.from.includes("@g.us");
-  if (isGroup) {
-    console.log("Group message received!");
-    return;
-  } else if (message.body.includes(".bot")) {
-    console.log("message to bot received!");
-    var query;
-    //Extracting text from message body using regular expression method
-    const regxmatch = message.body.match(/.bot(.+)/);
-
-    //If no text followed by .bot then we use "Hi" as text
-    if (regxmatch) {
-      query = regxmatch[1];
-    } else {
-      console.log("No regex match!");
-      query = "Hi";
+      const messageContent = message.message.conversation || message.message.extendedTextMessage?.text;
+      if (messageContent && messageContent.startsWith(".bot")) {
+        const query = messageContent.slice(4).trim() || "Hi";
+        const response = await generateResponse(query);
+        await sock.sendMessage(message.key.remoteJid, { text: response });
+      }
+    } catch (err) {
+      console.error("Error handling message:", err);
     }
+  });
 
-    //Call the generate function
-    generate(query, message);
-  }
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update;
+    if (connection === "close") {
+      const reason = new Boom(lastDisconnect?.error)?.output.statusCode;
+      switch (reason) {
+        case DisconnectReason.badSession:
+          console.log("Sesi buruk, harap hapus sesi dan scan ulang.");
+          process.exit();
+          break;
+        case DisconnectReason.connectionClosed:
+          console.log("Koneksi terputus, mencoba menghubungkan kembali...");
+          startBot();
+          break;
+        case DisconnectReason.loggedOut:
+          console.log("Terlogout, harap hapus sesi dan scan ulang.");
+          process.exit();
+          break;
+        default:
+          console.log(`Terputus dengan alasan tidak dikenal: ${reason}`);
+          startBot();
+          break;
+      }
+    } else if (connection === "open") {
+      console.log("Terhubung ke WhatsApp Web.");
+    }
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+}
+
+startBot();
+
+fs.watchFile(__filename, () => {
+  fs.unwatchFile(__filename);
+  console.log(`Update pada file ${__filename}`);
+  delete require.cache[require.resolve(__filename)];
+  require(__filename);
 });
-
-client.initialize();
